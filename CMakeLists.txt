@@ -12,26 +12,24 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 find_package(Threads REQUIRED)
 find_library(SNDFILE_LIB sndfile REQUIRED)
-
-option(USE_OPUS "Enable Opus codec" OFF)
+find_library(WEBSOCKETS_LIB websockets REQUIRED)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_options(-fsanitize=address -fsanitize=undefined -g -O1)
-    add_link_options   (-fsanitize=address -fsanitize=undefined)
+    add_compile_options(-g -O1)
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O3 -DNDEBUG)
 endif()
 
-set(AUDIO_LIBS dl m)
-
+# Server
 add_executable(audiostream_server src/server.cpp)
 target_link_libraries(audiostream_server
-    PRIVATE Threads::Threads ${SNDFILE_LIB})
+    PRIVATE Threads::Threads ${SNDFILE_LIB} ${WEBSOCKETS_LIB})
 
+# Client
 add_executable(audiostream_client src/client.cpp)
 target_link_libraries(audiostream_client
-    PRIVATE Threads::Threads ${AUDIO_LIBS})
+    PRIVATE Threads::Threads dl m)

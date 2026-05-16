@@ -23,6 +23,34 @@ public:
         ring_[ring_pos_++ % RING] = ms;
     }
 
+    struct Snapshot {
+        int32_t  lat_min, lat_avg, lat_p95, lat_max;
+        uint64_t sent, recv, lost;
+        double   loss_pct;
+    };
+
+    Snapshot snapshot() const {
+        Snapshot s{};
+        s.sent = sent_.load();
+        s.recv = recv_.load();
+        s.lost = lost_.load();
+        s.loss_pct = s.sent > 0 ? (100.0 * s.lost / s.sent) : 0.0;
+        std::unique_lock<std::mutex> lock(mu_);
+        s.lat_min = lat_min_ == INT_MAX ? 0 : lat_min_;
+        s.lat_max = lat_max_ == INT_MIN ? 0 : lat_max_;
+        if (lat_count_ > 0) s.lat_avg = (int32_t)(lat_sum_ / lat_count_);
+        int32_t tmp[RING];
+        size_t cnt = lat_count_ < RING ? lat_count_ : RING;
+        for (size_t i = 0; i < cnt; ++i) tmp[i] = ring_[i];
+        for (size_t i = 1; i < cnt; ++i) {
+            int32_t k = tmp[i]; size_t j = i;
+            while (j > 0 && tmp[j-1] > k) { tmp[j] = tmp[j-1]; --j; }
+            tmp[j] = k;
+        }
+        if (cnt > 0) s.lat_p95 = tmp[(size_t)(cnt * 0.95)];
+        return s;
+    }
+
     void maybe_print() {
         auto now = std::chrono::steady_clock::now();
         if (now - last_print_ < std::chrono::seconds(10)) return;
@@ -32,31 +60,13 @@ public:
     }
 
     void print() const {
-        uint64_t s = sent_.load();
-        uint64_t r = recv_.load();
-        uint64_t l = lost_.load();
-        double loss_pct = s > 0 ? (100.0 * l / s) : 0.0;
-        int32_t avg = 0, p95 = 0;
-        {
-            std::unique_lock<std::mutex> lock(mu_);
-            if (lat_count_ > 0) avg = (int32_t)(lat_sum_ / lat_count_);
-            int32_t tmp[RING];
-            size_t cnt = lat_count_ < RING ? lat_count_ : RING;
-            for (size_t i = 0; i < cnt; ++i) tmp[i] = ring_[i];
-            for (size_t i = 1; i < cnt; ++i) {
-                int32_t k = tmp[i]; size_t j = i;
-                while (j > 0 && tmp[j-1] > k) { tmp[j] = tmp[j-1]; --j; }
-                tmp[j] = k;
-            }
-            if (cnt > 0) p95 = tmp[(size_t)(cnt * 0.95)];
-        }
+        auto s = snapshot();
         printf("+- Stream Health ----------------------------------------------\n");
         printf("| Sent: %6llu  Recv: %6llu  Lost: %llu (%.1f%%)\n",
-               (unsigned long long)s, (unsigned long long)r,
-               (unsigned long long)l, loss_pct);
+               (unsigned long long)s.sent, (unsigned long long)s.recv,
+               (unsigned long long)s.lost, s.loss_pct);
         printf("| Latency:  min=%dms  avg=%dms  p95=%dms  max=%dms\n",
-               lat_min_ == INT_MAX ? 0 : lat_min_, avg, p95,
-               lat_max_ == INT_MIN ? 0 : lat_max_);
+               s.lat_min, s.lat_avg, s.lat_p95, s.lat_max);
         printf("+-------------------------------------------------------------\n");
         fflush(stdout);
     }
@@ -66,11 +76,11 @@ private:
 
     void reset() {
         sent_ = recv_ = lost_ = 0;
-        lat_min_   = INT_MAX;
-        lat_max_   = INT_MIN;
-        lat_sum_   = 0;
-        lat_count_ = 0;
-        ring_pos_  = 0;
+        lat_min_    = INT_MAX;
+        lat_max_    = INT_MIN;
+        lat_sum_    = 0;
+        lat_count_  = 0;
+        ring_pos_   = 0;
         last_print_ = std::chrono::steady_clock::now();
     }
 

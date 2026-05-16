@@ -1,0 +1,255 @@
+# AudioStream — Real-Time Audio Streaming System
+
+A low-latency, distributed audio streaming platform built in C++ for Linux.
+Streams live audio between devices over a local network using TCP and UDP sockets.
+
+Think: **mini Sonos streaming pipeline** / **LAN audio broadcaster**.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────┐       TCP / UDP        ┌──────────────────────────────────┐
+│            SERVER               │  ─────────────────────► │            CLIENT                │
+│                                 │                         │                                  │
+│  Thread 1: Audio Capture        │                         │  Thread 1: Packet Receiver       │
+│  ┌────────────────────────┐     │                         │  ┌─────────────────────────────┐ │
+│  │  WAV file OR mic input  │     │                         │  │  recv() → validate seq ID   │ │
+│  │  → PCM chunks (20ms)    │     │                         │  └─────────────┬───────────────┘ │
+│  └──────────┬─────────────┘     │                         │                │ push            │
+│             │ push              │                         │  ┌─────────────▼───────────────┐ │
+│  ┌──────────▼─────────────┐     │                         │  │      Jitter Buffer          │ │
+│  │   BlockingQueue         │     │                         │  │  Reorder | hold | drain     │ │
+│  └──────────┬─────────────┘     │                         │  └─────────────┬───────────────┘ │
+│             │ pop               │                         │                │ pop             │
+│  Thread 2: Packet Sender        │                         │  Thread 2: Audio Playback        │
+│  ┌──────────▼─────────────┐     │                         │  ┌─────────────▼───────────────┐ │
+│  │  Packetize + seq IDs    │─────┼──────────────────────►  │  │  PCM → speaker (miniaudio)  │ │
+│  │  TCP_NODELAY / UDP      │     │                         │  │  PLC on loss                │ │
+│  └─────────────────────────┘    │                         │  └─────────────────────────────┘ │
+│                                 │                         │                                  │
+│  Metrics / Logger               │                         │  Metrics / Logger                │
+└─────────────────────────────────┘                         └──────────────────────────────────┘
+```
+
+### Key design decisions
+
+| Concern | Decision | Why |
+|---|---|---|
+| Inter-thread queue | `BlockingQueue<AudioPacket>` | Sender should sleep when idle; simplicity > lock-free here |
+| Packet reordering | `JitterBuffer` (std::map + cv) | O(log n) insert, in-order pop, handles late/lost packets |
+| Audio I/O | `miniaudio` (single-header) | Zero dependencies, works on ALSA/PulseAudio/PipeWire |
+| Protocol | TCP default, UDP optional | TCP for reliability comparison, UDP to study jitter |
+| Loss concealment | Repeat last frame | Simple and effective; Opus PLC replaces this in Phase 2 |
+| Latency budget | 20ms chunk + 80ms jitter = ~100ms | Good baseline; tune `--jitter` down for lower latency |
+
+---
+
+## Quick Start
+
+### 1. Setup (first time)
+
+```bash
+git clone <your-repo-url> audiostream
+cd audiostream
+chmod +x setup.sh scripts/*.sh
+./setup.sh
+```
+
+This will:
+- Download `miniaudio.h` (single-header audio library)
+- Generate a `test.wav` file (requires `ffmpeg`)
+- Configure the CMake build
+
+### 2. Build
+
+```bash
+./scripts/build.sh
+# or manually:
+cmake --build build -j$(nproc)
+```
+
+### 3. Run (two terminals)
+
+**Terminal 1 — Server:**
+```bash
+./build/audiostream_server --source=file:test.wav --loop
+```
+
+**Terminal 2 — Client (same machine):**
+```bash
+./build/audiostream_client --host=127.0.0.1
+```
+
+**Over LAN:**
+```bash
+# On server machine (find its IP with: ip addr)
+./build/audiostream_server --source=file:music.wav
+
+# On client machine
+./build/audiostream_client --host=192.168.1.42
+```
+
+### 4. Quick loopback test
+
+```bash
+./scripts/test_local.sh tcp    # TCP test
+./scripts/test_local.sh udp    # UDP test
+./scripts/test_local.sh tcp 40 # TCP with 40ms jitter buffer
+```
+
+---
+
+## Usage Reference
+
+### Server
+
+```
+./build/audiostream_server [OPTIONS]
+
+  --source=file:<path>   Stream a WAV file
+  --source=mic           Capture from microphone
+  --loop                 Loop WAV file (default: on)
+  --port=<N>             Data port (default: 9001)
+  --proto=tcp|udp        Transport protocol (default: tcp)
+  --bind=<addr>          Bind address (default: 0.0.0.0)
+  --debug                Enable debug logging
+```
+
+### Client
+
+```
+./build/audiostream_client [OPTIONS]
+
+  --host=<addr>          Server address (default: 127.0.0.1)
+  --port=<N>             Server port (default: 9001)
+  --proto=tcp|udp        Transport protocol (default: tcp)
+  --jitter=<ms>          Jitter buffer depth in ms (default: 80)
+  --debug                Enable debug logging
+```
+
+---
+
+## Wire Protocol
+
+Every packet on the wire is:
+
+```
+[ PacketHeader (16 bytes) ][ payload (variable) ]
+
+PacketHeader:
+  magic[2]        = 0xAD 0xD0
+  version         = 0x01
+  type            = AUDIO | HANDSHAKE | HEARTBEAT | GOODBYE
+  sequence_id     = uint32, monotonically increasing
+  timestamp_ms    = uint32, server wall-clock at capture time
+  payload_bytes   = uint32, length of following payload
+```
+
+Audio payload: raw signed 16-bit PCM, stereo interleaved, 48 kHz.
+Each chunk = 960 frames = 20ms of audio.
+
+See `docs/wireshark_filter.md` for Wireshark filters to inspect the traffic live.
+
+---
+
+## Dependencies
+
+| Library | License | Notes |
+|---|---|---|
+| [miniaudio](https://github.com/mackron/miniaudio) | MIT | Single-header audio I/O. No system deps. |
+| pthreads | System | Via CMake `find_package(Threads)` |
+| Linux sockets | System | POSIX BSD sockets |
+
+No `apt install` required for audio — miniaudio links directly to ALSA/PipeWire.
+
+---
+
+## Building with Optional Features
+
+### Enable Opus codec (Phase 2)
+
+```bash
+sudo apt install libopus-dev
+cmake -S . -B build -DUSE_OPUS=ON
+cmake --build build -j$(nproc)
+```
+
+### Release build (no ASAN, full optimisation)
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release -j$(nproc)
+```
+
+### Debug with AddressSanitizer + ThreadSanitizer
+
+The Debug build already enables both. If you hit a TSAN false positive in miniaudio's ring buffer, suppress it:
+
+```bash
+TSAN_OPTIONS="suppressions=scripts/tsan_suppress.txt" ./build/audiostream_server ...
+```
+
+---
+
+## Phase Roadmap
+
+| Phase | Status | Features |
+|---|---|---|
+| 1 | ✅ Complete | TCP streaming, WAV file source, client playback, basic buffering |
+| 2 | ✅ Complete | Mic capture, multithreading, jitter buffer, packet loss concealment |
+| 3 | 🔲 Next | UDP mode, sequence IDs, latency metrics dashboard |
+| 4 | 🔲 Future | Opus codec, multi-room sync, WebSocket metrics UI |
+
+---
+
+## Debugging Tips
+
+### Check if server is accepting connections
+```bash
+ss -tlnp | grep 9001
+```
+
+### Monitor packet flow live
+```bash
+# Count packets per second
+tcpdump -i lo port 9001 -q | pv -l -r > /dev/null
+
+# Wireshark on loopback
+wireshark -i lo -f "port 9001"
+```
+
+### Measure latency with ping as a reference
+```bash
+ping -i 0.02 192.168.1.42   # 20ms interval = one audio chunk
+```
+
+### Enable verbose logging
+```bash
+./build/audiostream_server --debug 2>&1 | tee server.log
+./build/audiostream_client --debug 2>&1 | tee client.log
+```
+
+### Watch metrics output
+
+The server and client both print a metrics summary every 10 seconds:
+
+```
+┌─ Stream Health ──────────────────────────────
+│ Sent:     1500  Recv: 1498  Lost: 2 (0.1%)
+│ Latency:  min=12ms  avg=18ms  p95=34ms  max=67ms
+│ Buffer:   4/4 chunks (100%)
+└──────────────────────────────────────────────
+```
+
+---
+
+## Resume Bullet Points (copy-paste ready)
+
+> **Real-Time Audio Streaming System** | C++, Linux, TCP/UDP, Multithreading
+>
+> - Built a low-latency audio streaming system in C++ capable of transmitting real-time audio across networked clients using TCP/UDP sockets
+> - Implemented multithreaded audio capture, packet buffering, and playback pipelines to support concurrent real-time streaming workloads
+> - Designed a jitter buffer with in-order packet delivery and loss concealment to reduce playback interruptions under unstable network conditions
+> - Debugged socket communication, timing issues, and packet loss using Wireshark, tcpdump, and system-level latency metrics instrumentation
